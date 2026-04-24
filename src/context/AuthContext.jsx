@@ -1,182 +1,193 @@
 import React, { createContext, useState, useEffect, useContext } from 'react';
-import { 
-  createUserWithEmailAndPassword,
-  signInWithEmailAndPassword,
-  signOut,
+import {
+  signInWithPopup,
+  signOut as firebaseSignOut,
   onAuthStateChanged,
   sendPasswordResetEmail,
-  signInWithPopup,
-  updateProfile
 } from 'firebase/auth';
-import { doc, setDoc, getDoc } from 'firebase/firestore';
-import { auth, googleProvider, db } from '../config/firebase';
+import { auth, googleProvider } from '../config/firebase';
+import authService from '../services/authService';
+import { storage } from '../utils/storage';
 import toast from 'react-hot-toast';
+import api from '../config/api';
 
 const AuthContext = createContext();
 
 export const useAuth = () => {
   const context = useContext(AuthContext);
-  if (!context) {
-    throw new Error('useAuth must be used within AuthProvider');
-  }
+  if (!context) throw new Error('useAuth must be used within AuthProvider');
   return context;
 };
 
 export const AuthProvider = ({ children }) => {
   const [currentUser, setCurrentUser] = useState(null);
-  const [userData, setUserData] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [userData, setUserData]       = useState(null);
+  const [loading, setLoading]         = useState(true);
+  const [authType, setAuthType]       = useState(null);
 
-  // Sign Up with Email/Password
-  const signup = async (email, password, name) => {
-    try {
-      const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-      const user = userCredential.user;
+  // ==================== Backend Auth ====================
 
-      // Update profile with name
-      await updateProfile(user, { displayName: name });
-
-      // Create user document in Firestore
-      await setDoc(doc(db, 'users', user.uid), {
-        uid: user.uid,
-        name: name,
-        email: email,
-        photoURL: user.photoURL || null,
-        subscription: 'free',
-        subscriptionExpiry: null,
-        createdAt: new Date().toISOString(),
-        analysesCount: 0
-      });
-
-      toast.success('Account created successfully! 🎉');
-      return user;
-    } catch (error) {
-      console.error('Signup error:', error);
-      if (error.code === 'auth/email-already-in-use') {
-        toast.error('Email already in use');
-      } else if (error.code === 'auth/weak-password') {
-        toast.error('Password should be at least 6 characters');
-      } else {
-        toast.error('Failed to create account');
-      }
-      throw error;
+  const signup = async (email, password, username) => {
+    const result = await authService.signup(email, username, password);
+    if (result.success) {
+      toast.success('Account created! Please login.');
+      return result.data;
     }
+    toast.error(result.error);
+    throw new Error(result.error);
   };
 
-  // Sign In with Email/Password
   const login = async (email, password) => {
-    try {
-      const userCredential = await signInWithEmailAndPassword(auth, email, password);
+    const result = await authService.login(email, password);
+    if (result.success) {
+      setCurrentUser(result.data.user);
+      setUserData(result.data.user);
+      setAuthType('backend');
       toast.success('Welcome back! 👋');
-      return userCredential.user;
-    } catch (error) {
-      console.error('Login error:', error);
-      if (error.code === 'auth/user-not-found' || error.code === 'auth/wrong-password') {
-        toast.error('Invalid email or password');
-      } else {
-        toast.error('Failed to sign in');
-      }
-      throw error;
+      return result.data.user;
     }
+    toast.error(result.error);
+    throw new Error(result.error);
   };
 
-  // Sign In with Google
+  const refreshUser = async () => {
+    try {
+      const user = await authService.fetchCurrentUser();
+      if (user) { setCurrentUser(user); setUserData(user); }
+      return user;
+    } catch { return null; }
+  };
+
+  // ==================== Google Auth ====================
+
   const signInWithGoogle = async () => {
     try {
       const result = await signInWithPopup(auth, googleProvider);
-      const user = result.user;
+      const firebaseUser = result.user;
 
-      // Check if user document exists
-      const userDoc = await getDoc(doc(db, 'users', user.uid));
-      
-      if (!userDoc.exists()) {
-        // Create new user document
-        await setDoc(doc(db, 'users', user.uid), {
-          uid: user.uid,
-          name: user.displayName,
-          email: user.email,
-          photoURL: user.photoURL,
-          subscription: 'free',
-          subscriptionExpiry: null,
-          createdAt: new Date().toISOString(),
-          analysesCount: 0
-        });
-      }
+      // ✅ سجل الـ Google user في الـ FastAPI backend واجيب JWT token حقيقي
+      const response = await api.post('/auth/google', {
+        email: firebaseUser.email,
+        google_uid: firebaseUser.uid,
+        display_name: firebaseUser.displayName,
+        photo_url: firebaseUser.photoURL,
+      });
+
+      const { access_token } = response.data;
+
+      // ✅ احفظ الـ token زي ما بيحصل مع الـ normal login
+      storage.setToken(access_token);
+
+      // ✅ جيب بيانات الـ user من الـ backend
+      const userResponse = await api.get('/auth/me');
+      const user = {
+        ...userResponse.data,
+        photoURL: firebaseUser.photoURL,
+        authProvider: 'google',
+      };
+      storage.setUser(user);
+
+      setCurrentUser(user);
+      setUserData(user);
+      setAuthType('google');
+
+      authService.startExpiryWatcher();
 
       toast.success('Signed in with Google! 🎉');
       return user;
+
     } catch (error) {
       console.error('Google sign-in error:', error);
-      toast.error('Failed to sign in with Google');
+      if (error.code === 'auth/popup-closed-by-user') {
+        toast.error('Sign-in cancelled');
+      } else if (error.code === 'auth/unauthorized-domain') {
+        toast.error('This domain is not authorized for Google sign-in');
+      } else {
+        toast.error('Failed to sign in with Google');
+      }
       throw error;
     }
   };
 
-  // Logout
+  // ==================== Logout ====================
+
   const logout = async () => {
     try {
-      await signOut(auth);
+      authService.logout();
+      if (authType === 'google') await firebaseSignOut(auth);
+    } catch (e) {
+      console.error('Logout error:', e);
+    } finally {
+      setCurrentUser(null);
       setUserData(null);
+      setAuthType(null);
       toast.success('Logged out successfully');
-    } catch (error) {
-      console.error('Logout error:', error);
-      toast.error('Failed to logout');
-      throw error;
     }
   };
 
-  // Reset Password
+  // ==================== Password Reset ====================
+
   const resetPassword = async (email) => {
     try {
       await sendPasswordResetEmail(auth, email);
       toast.success('Password reset email sent! 📧');
     } catch (error) {
-      console.error('Reset password error:', error);
-      if (error.code === 'auth/user-not-found') {
-        toast.error('No account found with this email');
-      } else {
-        toast.error('Failed to send reset email');
-      }
+      toast.error(error.code === 'auth/user-not-found'
+        ? 'No account found with this email'
+        : 'Failed to send reset email');
       throw error;
     }
   };
 
-  // Fetch user data from Firestore
-  const fetchUserData = async (uid) => {
-    try {
-      const userDoc = await getDoc(doc(db, 'users', uid));
-      if (userDoc.exists()) {
-        setUserData(userDoc.data());
-      }
-    } catch (error) {
-      console.error('Error fetching user data:', error);
-    }
-  };
+  // ==================== Init on Load ====================
 
-  // Auth state observer
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      setCurrentUser(user);
-      if (user) {
-        await fetchUserData(user.uid);
+    let backendResolved = false;
+
+    const backendUser = authService.getCurrentUser();
+    const tokenExpired = authService.isTokenExpired();
+
+    if (backendUser && !tokenExpired) {
+      setCurrentUser(backendUser);
+      setUserData(backendUser);
+      setAuthType(backendUser.authProvider === 'google' ? 'google' : 'backend');
+      backendResolved = true;
+
+      authService.fetchCurrentUser().then(freshUser => {
+        if (freshUser) { setCurrentUser(freshUser); setUserData(freshUser); }
+      });
+      authService.startExpiryWatcher();
+    } else if (tokenExpired && backendUser) {
+      authService.logout();
+    }
+
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      // لو مفيش backend token، مش بنعمل حاجة - الـ Google login هيتعمل manually
+      if (!backendResolved) {
+        setLoading(false);
       } else {
-        setUserData(null);
+        setLoading(false);
       }
-      setLoading(false);
     });
 
     return unsubscribe;
   }, []);
 
+  // ==================== Context Value ====================
+
   const value = {
     currentUser,
     userData,
+    authType,
+    isBackendUser: authType === 'backend',
+    isGoogleUser: authType === 'google',
+    isAuthenticated: !!currentUser,
     signup,
     login,
     logout,
+    refreshUser,
     signInWithGoogle,
     resetPassword,
-    fetchUserData
   };
 
   return (
